@@ -539,7 +539,7 @@ impl Tab {
         styled_underlines: bool,
     ) -> Self {
         let name = if name.is_empty() {
-            format!("Tab #{}", index + 1)
+            format!("{}", index + 1)
         } else {
             name
         };
