@@ -9,10 +9,11 @@ use std::time::Duration;
 
 use log::{debug, warn};
 use zellij_utils::data::{
-    Direction, PaneManifest, PluginPermission, Resize, ResizeStrategy, SessionInfo,
+    Direction, KeyWithModifier, PaneManifest, PluginPermission, Resize, ResizeStrategy, SessionInfo,
 };
 use zellij_utils::errors::prelude::*;
 use zellij_utils::input::command::RunCommand;
+use zellij_utils::input::keybinds::Keybinds;
 use zellij_utils::input::options::Clipboard;
 use zellij_utils::pane_size::{Size, SizeInPixels};
 use zellij_utils::{
@@ -158,7 +159,8 @@ pub enum ScreenInstruction {
     ToggleFloatingPanes(ClientId, Option<TerminalAction>),
     HorizontalSplit(PaneId, Option<InitialTitle>, HoldForCommand, ClientId),
     VerticalSplit(PaneId, Option<InitialTitle>, HoldForCommand, ClientId),
-    WriteCharacter(Vec<u8>, ClientId),
+    WriteCharacter(Option<KeyWithModifier>, Vec<u8>, bool, ClientId), // bool ->
+    // is_kitty_keyboard_protocol
     Resize(ClientId, ResizeStrategy),
     SwitchFocus(ClientId),
     FocusNextPane(ClientId),
@@ -359,6 +361,7 @@ pub enum ScreenInstruction {
     DumpLayoutToHd,
     RenameSession(String, ClientId), // String -> new name
     ListClientsMetadata(Option<PathBuf>, ClientId), // Option<PathBuf> - default shell
+    RebindKeys(Keybinds, ClientId),
 }
 
 impl From<&ScreenInstruction> for ScreenContext {
@@ -543,6 +546,7 @@ impl From<&ScreenInstruction> for ScreenContext {
             ScreenInstruction::DumpLayoutToHd => ScreenContext::DumpLayoutToHd,
             ScreenInstruction::RenameSession(..) => ScreenContext::RenameSession,
             ScreenInstruction::ListClientsMetadata(..) => ScreenContext::ListClientsMetadata,
+            ScreenInstruction::RebindKeys(..) => ScreenContext::RebindKeys,
         }
     }
 }
@@ -621,6 +625,7 @@ pub(crate) struct Screen {
     arrow_fonts: bool,
     layout_dir: Option<PathBuf>,
     default_layout_name: Option<String>,
+    explicitly_disable_kitty_keyboard_protocol: bool,
 }
 
 impl Screen {
@@ -644,6 +649,7 @@ impl Screen {
         styled_underlines: bool,
         arrow_fonts: bool,
         layout_dir: Option<PathBuf>,
+        explicitly_disable_kitty_keyboard_protocol: bool,
     ) -> Self {
         let session_name = mode_info.session_name.clone().unwrap_or_default();
         let session_info = SessionInfo::new(session_name.clone());
@@ -684,6 +690,7 @@ impl Screen {
             arrow_fonts,
             resurrectable_sessions,
             layout_dir,
+            explicitly_disable_kitty_keyboard_protocol,
         }
     }
 
@@ -1034,15 +1041,19 @@ impl Screen {
     pub fn resize_to_screen(&mut self, new_screen_size: Size) -> Result<()> {
         let err_context = || format!("failed to resize to screen size: {new_screen_size:#?}");
 
-        self.size = new_screen_size;
-        for tab in self.tabs.values_mut() {
-            tab.resize_whole_tab(new_screen_size)
+        if self.size != new_screen_size {
+            self.size = new_screen_size;
+            for tab in self.tabs.values_mut() {
+                tab.resize_whole_tab(new_screen_size)
+                    .with_context(err_context)?;
+                tab.set_force_render();
+            }
+            self.log_and_report_session_state()
                 .with_context(err_context)?;
-            tab.set_force_render();
+            self.render(None).with_context(err_context)
+        } else {
+            Ok(())
         }
-        self.log_and_report_session_state()
-            .with_context(err_context)?;
-        self.render(None).with_context(err_context)
     }
 
     pub fn update_pixel_dimensions(&mut self, pixel_dimensions: PixelDimensions) {
@@ -1232,6 +1243,7 @@ impl Screen {
             self.debug,
             self.arrow_fonts,
             self.styled_underlines,
+            self.explicitly_disable_kitty_keyboard_protocol,
         );
         self.tabs.insert(tab_index, tab);
         Ok(())
@@ -1765,12 +1777,6 @@ impl Screen {
             tab.mark_active_pane_for_rerender(client_id);
             tab.update_input_modes()?;
         }
-
-        if let Some(os_input) = &mut self.bus.os_input {
-            let _ =
-                os_input.send_to_client(client_id, ServerToClientMsg::SwitchToMode(mode_info.mode));
-        }
-
         Ok(())
     }
     pub fn change_mode_for_all_clients(&mut self, mode_info: ModeInfo) -> Result<()> {
@@ -2145,6 +2151,23 @@ impl Screen {
         }
         Ok(())
     }
+    pub fn rebind_keys(&mut self, new_keybinds: Keybinds, client_id: ClientId) -> Result<()> {
+        if self.connected_clients_contains(&client_id) {
+            let mode_info = self
+                .mode_info
+                .entry(client_id)
+                .or_insert_with(|| self.default_mode_info.clone());
+            mode_info.update_keybinds(new_keybinds);
+            for tab in self.tabs.values_mut() {
+                tab.change_mode_info(mode_info.clone(), client_id);
+                tab.mark_active_pane_for_rerender(client_id);
+                tab.update_input_modes()?;
+            }
+        } else {
+            log::error!("Could not find client_id {client_id} to rebind keys");
+        }
+        Ok(())
+    }
     fn unblock_input(&self) -> Result<()> {
         self.bus
             .senders
@@ -2286,6 +2309,9 @@ impl Screen {
         }
         found_plugin
     }
+    fn connected_clients_contains(&self, client_id: &ClientId) -> bool {
+        self.connected_clients.borrow().contains(client_id)
+    }
 }
 
 // The box is here in order to make the
@@ -2317,6 +2343,13 @@ pub(crate) fn screen_thread_main(
         config_options.copy_on_select.unwrap_or(true),
     );
     let styled_underlines = config_options.styled_underlines.unwrap_or(true);
+    let explicitly_disable_kitty_keyboard_protocol = config_options
+        .support_kitty_keyboard_protocol
+        .map(|e| !e) // this is due to the config options wording, if
+        // "support_kitty_keyboard_protocol" is true,
+        // explicitly_disable_kitty_keyboard_protocol is false and vice versa
+        .unwrap_or(false); // by default, we try to support this if the terminal supports it and
+                           // the program running inside a pane requests it
 
     let thread_senders = bus.senders.clone();
     let mut screen = Screen::new(
@@ -2345,6 +2378,7 @@ pub(crate) fn screen_thread_main(
         styled_underlines,
         arrow_fonts,
         layout_dir,
+        explicitly_disable_kitty_keyboard_protocol,
     );
 
     let mut pending_tab_ids: HashSet<usize> = HashSet::new();
@@ -2536,15 +2570,20 @@ pub(crate) fn screen_thread_main(
                 screen.log_and_report_session_state()?;
                 screen.render(None)?;
             },
-            ScreenInstruction::WriteCharacter(bytes, client_id) => {
+            ScreenInstruction::WriteCharacter(
+                key_with_modifier,
+                raw_bytes,
+                is_kitty_keyboard_protocol,
+                client_id,
+            ) => {
                 let mut state_changed = false;
                 active_tab_and_connected_client_id!(
                     screen,
                     client_id,
                     |tab: &mut Tab, client_id: ClientId| {
                         let write_result = match tab.is_sync_panes_active() {
-                            true => tab.write_to_terminals_on_current_tab(bytes, client_id),
-                            false => tab.write_to_active_terminal(bytes, client_id),
+                            true => tab.write_to_terminals_on_current_tab(&key_with_modifier, raw_bytes, is_kitty_keyboard_protocol, client_id),
+                            false => tab.write_to_active_terminal(&key_with_modifier, raw_bytes, is_kitty_keyboard_protocol, client_id),
                         };
                         if let Ok(true) = write_result {
                             state_changed = true;
@@ -3987,6 +4026,9 @@ pub(crate) fn screen_thread_main(
                     set_session_name(name);
                 }
                 screen.unblock_input()?;
+            },
+            ScreenInstruction::RebindKeys(new_keybinds, client_id) => {
+                screen.rebind_keys(new_keybinds, client_id).non_fatal();
             },
         }
     }

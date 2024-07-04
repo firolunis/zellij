@@ -15,7 +15,7 @@ use std::{
     str::FromStr,
     sync::{Arc, Mutex},
 };
-use wasmer::{Module, Store, Value};
+use wasmtime::{Engine, Module};
 use zellij_utils::async_channel::Sender;
 use zellij_utils::async_std::task::{self, JoinHandle};
 use zellij_utils::consts::ZELLIJ_CACHE_DIR;
@@ -77,7 +77,7 @@ impl PluginRenderAsset {
 pub struct WasmBridge {
     connected_clients: Arc<Mutex<Vec<ClientId>>>,
     senders: ThreadSenders,
-    store: Arc<Mutex<Store>>,
+    engine: Engine,
     plugin_dir: PathBuf,
     plugin_cache: Arc<Mutex<HashMap<PathBuf, Module>>>,
     plugin_map: Arc<Mutex<PluginMap>>,
@@ -107,7 +107,7 @@ pub struct WasmBridge {
 impl WasmBridge {
     pub fn new(
         senders: ThreadSenders,
-        store: Arc<Mutex<Store>>,
+        engine: Engine,
         plugin_dir: PathBuf,
         path_to_default_shell: PathBuf,
         zellij_cwd: PathBuf,
@@ -125,7 +125,7 @@ impl WasmBridge {
         WasmBridge {
             connected_clients,
             senders,
-            store,
+            engine,
             plugin_dir,
             plugin_cache,
             plugin_map,
@@ -192,7 +192,7 @@ impl WasmBridge {
                     let plugin_dir = self.plugin_dir.clone();
                     let plugin_cache = self.plugin_cache.clone();
                     let senders = self.senders.clone();
-                    let store = self.store.clone();
+                    let engine = self.engine.clone();
                     let plugin_map = self.plugin_map.clone();
                     let connected_clients = self.connected_clients.clone();
                     let path_to_default_shell = self.path_to_default_shell.clone();
@@ -236,7 +236,7 @@ impl WasmBridge {
                             plugin_dir,
                             plugin_cache,
                             senders.clone(),
-                            store,
+                            engine,
                             plugin_map,
                             size,
                             connected_clients.clone(),
@@ -291,7 +291,7 @@ impl WasmBridge {
                 drop(worker_sender.send(MessageToWorker::Exit));
             }
             let running_plugin = running_plugin.lock().unwrap();
-            let cache_dir = running_plugin.plugin_env.plugin_own_data_dir.clone();
+            let cache_dir = running_plugin.store.data().plugin_own_data_dir.clone();
             if let Err(e) = std::fs::remove_dir_all(cache_dir) {
                 log::error!("Failed to remove cache dir for plugin: {:?}", e);
             }
@@ -330,7 +330,7 @@ impl WasmBridge {
             let plugin_dir = self.plugin_dir.clone();
             let plugin_cache = self.plugin_cache.clone();
             let senders = self.senders.clone();
-            let store = self.store.clone();
+            let engine = self.engine.clone();
             let plugin_map = self.plugin_map.clone();
             let connected_clients = self.connected_clients.clone();
             let path_to_default_shell = self.path_to_default_shell.clone();
@@ -346,7 +346,7 @@ impl WasmBridge {
                     plugin_dir.clone(),
                     plugin_cache.clone(),
                     senders.clone(),
-                    store.clone(),
+                    engine.clone(),
                     plugin_map.clone(),
                     connected_clients.clone(),
                     &mut loading_indication,
@@ -371,7 +371,7 @@ impl WasmBridge {
                                 plugin_dir.clone(),
                                 plugin_cache.clone(),
                                 senders.clone(),
-                                store.clone(),
+                                engine.clone(),
                                 plugin_map.clone(),
                                 connected_clients.clone(),
                                 &mut loading_indication,
@@ -423,7 +423,7 @@ impl WasmBridge {
             self.plugin_dir.clone(),
             self.plugin_cache.clone(),
             self.senders.clone(),
-            self.store.clone(),
+            self.engine.clone(),
             self.plugin_map.clone(),
             self.connected_clients.clone(),
             &mut loading_indication,
@@ -491,23 +491,17 @@ impl WasmBridge {
                                 let rendered_bytes = running_plugin
                                     .instance
                                     .clone()
-                                    .exports
-                                    .get_function("render")
-                                    .map_err(anyError::new)
+                                    .get_typed_func::<(i32, i32), ()>(
+                                        &mut running_plugin.store,
+                                        "render",
+                                    )
                                     .and_then(|render| {
-                                        render
-                                            .call(
-                                                &mut running_plugin.store,
-                                                &[
-                                                    Value::I32(new_rows as i32),
-                                                    Value::I32(new_columns as i32),
-                                                ],
-                                            )
-                                            .map_err(anyError::new)
+                                        render.call(
+                                            &mut running_plugin.store,
+                                            (new_rows as i32, new_columns as i32),
+                                        )
                                     })
-                                    .and_then(|_| {
-                                        wasi_read_string(&running_plugin.plugin_env.wasi_env)
-                                    })
+                                    .and_then(|_| wasi_read_string(running_plugin.store.data()))
                                     .with_context(err_context);
                                 match rendered_bytes {
                                     Ok(rendered_bytes) => {
@@ -543,8 +537,6 @@ impl WasmBridge {
         mut updates: Vec<(Option<PluginId>, Option<ClientId>, Event)>,
         shutdown_sender: Sender<()>,
     ) -> Result<()> {
-        let err_context = || "failed to update plugin state".to_string();
-
         let plugins_to_update: Vec<(
             PluginId,
             ClientId,
@@ -563,57 +555,62 @@ impl WasmBridge {
                     .contains_key(&plugin_id)
             })
             .collect();
-        for (pid, cid, event) in updates.drain(..) {
-            for (plugin_id, client_id, running_plugin, subscriptions) in &plugins_to_update {
-                let subs = subscriptions.lock().unwrap().clone();
-                // FIXME: This is very janky... Maybe I should write my own macro for Event -> EventType?
-                let event_type =
-                    EventType::from_str(&event.to_string()).with_context(err_context)?;
-                if (subs.contains(&event_type) || event_type == EventType::PermissionRequestResult)
-                    && Self::message_is_directed_at_plugin(pid, cid, plugin_id, client_id)
-                {
-                    task::spawn({
-                        let senders = self.senders.clone();
-                        let running_plugin = running_plugin.clone();
-                        let event = event.clone();
-                        let plugin_id = *plugin_id;
-                        let client_id = *client_id;
-                        let _s = shutdown_sender.clone();
-                        async move {
-                            let mut running_plugin = running_plugin.lock().unwrap();
-                            let mut plugin_render_assets = vec![];
-                            let _s = _s; // guard to allow the task to complete before cleanup/shutdown
-                            match apply_event_to_plugin(
-                                plugin_id,
-                                client_id,
-                                &mut running_plugin,
-                                &event,
-                                &mut plugin_render_assets,
-                                senders.clone(),
-                            ) {
-                                Ok(()) => {
-                                    let _ = senders.send_to_screen(ScreenInstruction::PluginBytes(
-                                        plugin_render_assets,
-                                    ));
-                                },
-                                Err(e) => {
-                                    log::error!("{:?}", e);
+        task::spawn({
+            let mut updates = updates.clone();
+            let senders = self.senders.clone();
+            let s = shutdown_sender.clone();
+            async move {
+                let _s = s;
+                for (pid, cid, event) in updates.drain(..) {
+                    for (plugin_id, client_id, running_plugin, subscriptions) in &plugins_to_update
+                    {
+                        let subs = subscriptions.lock().unwrap().clone();
+                        // FIXME: This is very janky... Maybe I should write my own macro for Event -> EventType?
+                        if let Ok(event_type) = EventType::from_str(&event.to_string()) {
+                            if (subs.contains(&event_type)
+                                || event_type == EventType::PermissionRequestResult)
+                                && Self::message_is_directed_at_plugin(
+                                    pid, cid, plugin_id, client_id,
+                                )
+                            {
+                                let mut running_plugin = running_plugin.lock().unwrap();
+                                let mut plugin_render_assets = vec![];
+                                match apply_event_to_plugin(
+                                    *plugin_id,
+                                    *client_id,
+                                    &mut running_plugin,
+                                    &event,
+                                    &mut plugin_render_assets,
+                                    senders.clone(),
+                                ) {
+                                    Ok(()) => {
+                                        let _ = senders.send_to_screen(
+                                            ScreenInstruction::PluginBytes(plugin_render_assets),
+                                        );
+                                    },
+                                    Err(e) => {
+                                        log::error!("{:?}", e);
 
-                                    // https://stackoverflow.com/questions/66450942/in-rust-is-there-a-way-to-make-literal-newlines-in-r-using-windows-c
-                                    let stringified_error =
-                                        format!("{:?}", e).replace("\n", "\n\r");
+                                        // https://stackoverflow.com/questions/66450942/in-rust-is-there-a-way-to-make-literal-newlines-in-r-using-windows-c
+                                        let stringified_error =
+                                            format!("{:?}", e).replace("\n", "\n\r");
 
-                                    handle_plugin_crash(
-                                        plugin_id,
-                                        stringified_error,
-                                        senders.clone(),
-                                    );
-                                },
+                                        handle_plugin_crash(
+                                            *plugin_id,
+                                            stringified_error,
+                                            senders.clone(),
+                                        );
+                                    },
+                                }
                             }
                         }
-                    });
+                    }
                 }
             }
+        });
+        // loop once more to update the cached events for the pending plugins (probably currently
+        // being loaded, we'll send them these events when they load)
+        for (pid, _cid, event) in updates.drain(..) {
             for (plugin_id, cached_events) in self.cached_events_for_pending_plugins.iter_mut() {
                 if pid.is_none() || pid.as_ref() == Some(plugin_id) {
                     cached_events.push(EventOrPipeMessage::Event(event.clone()));
@@ -1075,12 +1072,13 @@ impl WasmBridge {
         };
 
         running_plugin
-            .plugin_env
+            .store
+            .data_mut()
             .set_permissions(HashSet::from_iter(permissions.clone()));
 
         let mut permission_cache = PermissionCache::from_path_or_default(cache_path);
         permission_cache.cache(
-            running_plugin.plugin_env.plugin.location.to_string(),
+            running_plugin.store.data().plugin.location.to_string(),
             permissions,
         );
 
@@ -1275,30 +1273,25 @@ pub fn apply_event_to_plugin(
     senders: ThreadSenders,
 ) -> Result<()> {
     let instance = &running_plugin.instance;
-    let plugin_env = &running_plugin.plugin_env;
     let rows = running_plugin.rows;
     let columns = running_plugin.columns;
 
     let err_context = || format!("Failed to apply event to plugin {plugin_id}");
-    match check_event_permission(plugin_env, event) {
+    match check_event_permission(running_plugin.store.data(), event) {
         (PermissionStatus::Granted, _) => {
             let protobuf_event: ProtobufEvent = event
                 .clone()
                 .try_into()
                 .map_err(|e| anyhow!("Failed to convert to protobuf: {:?}", e))?;
             let update = instance
-                .exports
-                .get_function("update")
+                .get_typed_func::<(), i32>(&mut running_plugin.store, "update")
                 .with_context(err_context)?;
-            wasi_write_object(&plugin_env.wasi_env, &protobuf_event.encode_to_vec())
+            wasi_write_object(running_plugin.store.data(), &protobuf_event.encode_to_vec())
                 .with_context(err_context)?;
-            let update_return = update
-                .call(&mut running_plugin.store, &[])
+            let should_render = update
+                .call(&mut running_plugin.store, ())
                 .with_context(err_context)?;
-            let mut should_render = match update_return.get(0) {
-                Some(Value::I32(n)) => *n == 1,
-                _ => false,
-            };
+            let mut should_render = should_render == 1;
             if let Event::PermissionRequestResult(..) = event {
                 // we always render in this case, otherwise the request permission screen stays on
                 // screen
@@ -1306,18 +1299,11 @@ pub fn apply_event_to_plugin(
             }
             if rows > 0 && columns > 0 && should_render {
                 let rendered_bytes = instance
-                    .exports
-                    .get_function("render")
-                    .map_err(anyError::new)
+                    .get_typed_func::<(i32, i32), ()>(&mut running_plugin.store, "render")
                     .and_then(|render| {
-                        render
-                            .call(
-                                &mut running_plugin.store,
-                                &[Value::I32(rows as i32), Value::I32(columns as i32)],
-                            )
-                            .map_err(anyError::new)
+                        render.call(&mut running_plugin.store, (rows as i32, columns as i32))
                     })
-                    .and_then(|_| wasi_read_string(&plugin_env.wasi_env))
+                    .and_then(|_| wasi_read_string(running_plugin.store.data()))
                     .with_context(err_context)?;
                 let pipes_to_block_or_unblock = pipes_to_block_or_unblock(running_plugin, None);
                 let plugin_render_asset = PluginRenderAsset::new(
