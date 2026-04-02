@@ -719,7 +719,7 @@ impl Tab {
         web_server_port: u16,
     ) -> Self {
         let name = if name.is_empty() {
-            format!("Tab #{}", id + 1)
+            format!("{}", id + 1)
         } else {
             name
         };
